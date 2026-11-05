@@ -1,6 +1,8 @@
 import os
 import sys
 import tomllib
+import random
+import time
 from pathlib import Path
 
 import requests
@@ -14,6 +16,7 @@ from wzj_signin.http_client import (
     RequestConfig,
     SignTarget,
     build_request_config,
+    OpenIDExpired,
     get_active_signs,
     make_session,
     submit_sign_in,
@@ -24,65 +27,74 @@ from wzj_signin.utils import jitter_position, sleep_with_progress
 
 
 def _load_config() -> dict:
-    """Load config: env vars take priority, config.toml as fallback."""
+    """Load shared settings and local credentials, preferring the saved OpenID."""
     file_cfg = {}
+    locations = []
     config_path = Path.cwd() / "config.toml"
     if config_path.exists():
         with open(config_path, "rb") as f:
-            file_cfg = tomllib.load(f).get("default", {})
+            document = tomllib.load(f)
+            file_cfg = document.get("default", {})
+            locations = document.get("locations", [])
 
-    open_id = os.environ.get("OPEN_ID") or file_cfg.get("openId")
-    course_id = os.environ.get("COURSE_ID") or file_cfg.get("courseId")
-    student_id = os.environ.get("STUDENT_ID") or file_cfg.get("studentId", "")
+    secrets_cfg = {}
+    secrets_path = Path.cwd() / "config.secrets.toml"
+    if secrets_path.exists():
+        with open(secrets_path, "rb") as f:
+            secrets_cfg = tomllib.load(f).get("default", {})
+
+    open_id = secrets_cfg.get("openId") or os.environ.get("OPEN_ID")
+    course_id = os.environ.get("COURSE_ID") or secrets_cfg.get("courseId")
+    student_id = os.environ.get("STUDENT_ID") or secrets_cfg.get("studentId", "")
     poll_interval = _parse_int(
         os.environ.get("POLL_INTERVAL") or file_cfg.get("pollInterval", 10),
         "POLL_INTERVAL",
     )
-    gps_lon = os.environ.get("GPS_LON") or file_cfg.get("gps_lon", "")
-    gps_lat = os.environ.get("GPS_LAT") or file_cfg.get("gps_lat", "")
-    positions = jitter_position(gps_lon, gps_lat) if gps_lon and gps_lat else None
-
-    if not open_id:
-        log.error("Missing OPEN_ID, set env var or provide config.toml")
-        sys.exit(1)
     if not course_id:
         log.error("Missing COURSE_ID, set env var or provide config.toml")
         sys.exit(1)
 
-    try:
-        request_config = build_request_config(
-            open_id=open_id,
-            api_base_url=os.environ.get("API_BASE_URL") or file_cfg.get("apiBaseUrl"),
-            connect_timeout=_parse_float(
-                os.environ.get("CONNECT_TIMEOUT")
-                or file_cfg.get("connectTimeout", DEFAULT_CONNECT_TIMEOUT),
-                "CONNECT_TIMEOUT",
-            ),
-            read_timeout=_parse_float(
-                os.environ.get("READ_TIMEOUT")
-                or file_cfg.get("readTimeout", DEFAULT_READ_TIMEOUT),
-                "READ_TIMEOUT",
-            ),
-            request_retries=_parse_int(
-                os.environ.get("REQUEST_RETRIES")
-                or file_cfg.get("requestRetries", DEFAULT_REQUEST_RETRIES),
-                "REQUEST_RETRIES",
-            ),
-            retry_backoff=_parse_float(
-                os.environ.get("RETRY_BACKOFF")
-                or file_cfg.get("retryBackoff", DEFAULT_RETRY_BACKOFF),
-                "RETRY_BACKOFF",
-            ),
-        )
-    except ValueError as exc:
-        log.error(str(exc))
-        sys.exit(1)
+    while True:
+        if not open_id:
+            open_id = _read_input("Enter OpenID or full TeacherMate URL: ", secret=True)
+        try:
+            request_config = build_request_config(
+                open_id=open_id,
+                api_base_url=os.environ.get("API_BASE_URL") or file_cfg.get("apiBaseUrl"),
+                connect_timeout=_parse_float(
+                    os.environ.get("CONNECT_TIMEOUT")
+                    or file_cfg.get("connectTimeout", DEFAULT_CONNECT_TIMEOUT),
+                    "CONNECT_TIMEOUT",
+                ),
+                read_timeout=_parse_float(
+                    os.environ.get("READ_TIMEOUT")
+                    or file_cfg.get("readTimeout", DEFAULT_READ_TIMEOUT),
+                    "READ_TIMEOUT",
+                ),
+                request_retries=_parse_int(
+                    os.environ.get("REQUEST_RETRIES")
+                    or file_cfg.get("requestRetries", DEFAULT_REQUEST_RETRIES),
+                    "REQUEST_RETRIES",
+                ),
+                retry_backoff=_parse_float(
+                    os.environ.get("RETRY_BACKOFF")
+                    or file_cfg.get("retryBackoff", DEFAULT_RETRY_BACKOFF),
+                    "RETRY_BACKOFF",
+                ),
+            )
+            break
+        except ValueError as exc:
+            if "OPEN_ID" not in str(exc):
+                raise SystemExit(str(exc)) from None
+            log.warning("Invalid OpenID format; enter an OpenID or full URL")
+            open_id = None
 
     return {
         "courseId": course_id,
         "studentId": student_id,
         "pollInterval": poll_interval,
-        "positions": positions,
+        "locations": locations,
+        "apiBaseUrl": os.environ.get("API_BASE_URL") or file_cfg.get("apiBaseUrl"),
         "requestConfig": request_config,
     }
 
@@ -109,26 +121,121 @@ def _parse_float(value: str | float, name: str) -> float:
         raise ValueError(f"{name} must be a number") from exc
 
 
+def _read_input(prompt: str, *, secret: bool = False) -> str:
+    if not sys.stdin.isatty():
+        raise SystemExit("Interactive terminal required for OpenID input and location selection")
+    try:
+        if secret:
+            from getpass import getpass
+
+            return getpass(prompt).strip()
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("Interactive input cancelled") from None
+
+
+def _renew_open_id(
+    session: requests.Session,
+    request_config: RequestConfig,
+    api_base_url: str | None,
+) -> RequestConfig:
+    while True:
+        raw = _read_input("Enter new OpenID or full TeacherMate URL (not saved): ", secret=True)
+        try:
+            updated = build_request_config(
+                open_id=raw,
+                api_base_url=api_base_url or (
+                    None if raw.startswith(("http://", "https://")) else request_config.api_base_url
+                ),
+                connect_timeout=request_config.connect_timeout,
+                read_timeout=request_config.read_timeout,
+                request_retries=request_config.request_retries,
+                retry_backoff=request_config.retry_backoff,
+            )
+        except ValueError:
+            log.warning("Invalid OpenID format; please try again")
+            continue
+        session.headers["openId"] = updated.open_id
+        return updated
+
+
+def _validate_open_id(
+    session: requests.Session,
+    request_config: RequestConfig,
+    poll_interval: int,
+    api_base_url: str | None,
+    *,
+    renew: bool = False,
+) -> RequestConfig:
+    if renew:
+        request_config = _renew_open_id(session, request_config, api_base_url)
+    while True:
+        try:
+            get_active_signs(session, request_config)
+            log.info("OpenID verified")
+            return request_config
+        except OpenIDExpired:
+            log.warning("OpenID expired; a new OpenID is required")
+            request_config = _renew_open_id(session, request_config, api_base_url)
+        except requests.RequestException as exc:
+            _log_request_error("OpenID check failed; keeping credentials and retrying", exc)
+            sleep_with_progress(poll_interval)
+
+
+def _select_location(locations: list[dict]) -> tuple[str, str]:
+    if not locations:
+        raise SystemExit("No locations configured; add [[locations]] entries to config.toml")
+    if not sys.stdin.isatty():
+        raise SystemExit("Interactive terminal required to select a GPS location")
+    for number, location in enumerate(locations, 1):
+        print(f"{number}. {location['name']}")
+    while True:
+        choice = _read_input("Select GPS location number: ")
+        try:
+            index = int(choice) - 1
+        except ValueError:
+            index = -1
+        if not 0 <= index < len(locations):
+            print("Invalid location number; please try again")
+            continue
+        location = locations[index]
+        log.info("Selected GPS location: %s", location["name"])
+        return jitter_position(str(location["lon"]), str(location["lat"]))
+
+
+def _log_request_error(message: str, exc: requests.RequestException) -> None:
+    status = exc.response.status_code if exc.response is not None else None
+    log.error("%s (%s, HTTP status=%s)", message, type(exc).__name__, status)
+
+
 def sign_in_one(
     session: requests.Session,
     request_config: RequestConfig,
     sign_target: SignTarget,
 ) -> bool:
+    # 普通签到 / GPS 签到：随机等待 8–10 秒
+    delay = random.uniform(8.0, 10.0)
+    log.info(
+        "Sign-in delay: %.2fs (signId=%s)",
+        delay,
+        sign_target.sign_id,
+    )
+    time.sleep(delay)
+
     result = submit_sign_in(session, request_config, sign_target)
     if "errorCode" in result:
         if result.get("errorCode") == 305:
             log.info(
-                "%s already signed signId=%s: %s",
+                "%s already signed signId=%s",
                 sign_target.course_name,
                 sign_target.sign_id,
-                result.get("msgClient"),
             )
             return True
         log.warning(
-            "%s sign-in failed signId=%s: %s",
+            "%s sign-in failed signId=%s errorCode=%s",
             sign_target.course_name,
             sign_target.sign_id,
-            result.get("msgClient", result),
+            result.get("errorCode"),
         )
         return False
     log.info(
@@ -209,7 +316,10 @@ def main() -> None:
     session = make_session(USER_AGENT, request_config)
     student_id = config["studentId"]
     poll_interval = config["pollInterval"]
-    positions = config["positions"]
+    request_config = _validate_open_id(
+        session, request_config, poll_interval, config["apiBaseUrl"]
+    )
+    positions = _select_location(config["locations"])
 
     log.info(
         "Sign-in monitor started, polling every %d seconds (connect timeout %.1fs, read timeout %.1fs, retries %d)",
@@ -227,35 +337,16 @@ def main() -> None:
             log.info("Poll succeeded, %d active sign(s)", len(signs))
             if signs:
                 process_signs(session, request_config, signs, student_id, positions)
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 401:
-                log.error("openId expired, please update config")
-                send_email("Monitor Error", "openId expired, please update config")
-                return
-            consecutive_errors += 1
-            log.error("Request error (consecutive #%d): %s", consecutive_errors, e)
-        except requests.ConnectTimeout as e:
-            consecutive_errors += 1
-            log.error(
-                "Connect timeout to %s (consecutive #%d, timeout %.1fs, retries %d): %s",
-                request_config.api_base_url,
-                consecutive_errors,
-                request_config.connect_timeout,
-                request_config.request_retries,
-                e,
+        except OpenIDExpired:
+            log.warning("OpenID expired; pausing monitoring for renewal")
+            send_email("Monitor Error", "OpenID expired; terminal input is required")
+            request_config = _validate_open_id(
+                session, request_config, poll_interval, config["apiBaseUrl"], renew=True
             )
-        except requests.ReadTimeout as e:
+            consecutive_errors = 0
+        except requests.RequestException as exc:
             consecutive_errors += 1
-            log.error(
-                "Read timeout from %s (consecutive #%d, timeout %.1fs): %s",
-                request_config.api_base_url,
-                consecutive_errors,
-                request_config.read_timeout,
-                e,
-            )
-        except requests.RequestException as e:
-            consecutive_errors += 1
-            log.error("Request error (consecutive #%d): %s", consecutive_errors, e)
-        except Exception:
-            log.exception("Unknown error")
+            _log_request_error(f"Request failed (consecutive #{consecutive_errors})", exc)
+        except Exception as exc:
+            log.error("Unexpected monitor error (%s)", type(exc).__name__)
         sleep_with_progress(poll_interval)

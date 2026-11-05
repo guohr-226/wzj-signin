@@ -61,7 +61,7 @@ class QRSign:
                 self._handle_qr(msg)
                 continue
             if not msg.get("successful"):
-                log.warning("faye %s failed: %s", channel, msg)
+                log.warning("faye %s request failed", channel)
                 continue
             if channel == "/meta/handshake":
                 self._client_id = msg["clientId"]
@@ -90,18 +90,17 @@ class QRSign:
         qr_url = data.get("qrUrl")
         if qr_url:
             log.info("QR code received, please scan:")
-            segno.make_qr(qr_url).terminal(border=1)
+            segno.make_qr(qr_url).terminal(compact=True, border=2)
             return
         student = data.get("student", {})
-        name = student.get("name", "")
         sid = str(student.get("studentNumber", ""))
         rank = student.get("rank", "")
         if sid == str(self.check_student_number).strip():
-            log.info("Sign-in success! %s(%s) rank: %s", name, sid, rank)
+            log.info("Sign-in success! rank: %s", rank)
             self._done.set()
             self._ws.close()
         else:
-            log.info("Other student signed in: %s(%s) rank: %s", name, sid, rank)
+            log.info("Other student signed in, rank: %s", rank)
 
     def _on_open(self, ws):
         log.info("WebSocket connected, handshaking...")
@@ -121,12 +120,12 @@ class QRSign:
         )
 
     def _on_error(self, _ws, err):
-        log.error("WebSocket error: %s", err)
+        log.error("WebSocket error (%s)", type(err).__name__)
 
     def _on_close(self, _ws, code, reason):
         if self._heartbeat:
             self._heartbeat.cancel()
-        log.info("WebSocket closed (%s: %s)", code, reason)
+        log.info("WebSocket closed (code=%s)", code)
 
     def start(self):
         """Block until sign-in succeeds or connection closes."""

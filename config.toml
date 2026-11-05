@@ -1,0 +1,66 @@
+[default]
+pollInterval = 10
+connectTimeout = 5
+readTimeout = 15
+requestRetries = 2
+retryBackoff = 1.0
+
+# Optional API base URL override.
+# When OPEN_ID is a full TeacherMate URL, the same scheme + host is used automatically.
+# apiBaseUrl = "https://v18.teachermate.cn"
+
+# Select one location interactively on each startup.
+[[locations]]
+name = "东十二"
+lon = 114.440465
+lat = 30.517877
+
+[[locations]]
+name = "东九-A区"
+lon = 114.433653
+lat = 30.519743
+
+[[locations]]
+name = "东九-B区"
+lon = 114.433165
+lat = 30.519453
+
+[[locations]]
+name = "东九-C区"
+lon = 114.432995
+lat = 30.519014
+
+[[locations]]
+name = "东九-D区"
+lon = 114.433286
+lat = 30.518387
+
+[[locations]]
+name = "西十二-北门"
+lon = 114.413702
+lat = 30.514882
+
+[[locations]]
+name = "西十二-南门"
+lon = 114.413811
+lat = 30.514386
+
+[[locations]]
+name = "西十二-东门"
+lon = 114.414505
+lat = 30.514723
+
+[[locations]]
+name = "西十二-西门"
+lon = 114.413069
+lat = 30.514554
+
+[[locations]]
+name = "计算机大楼"
+lon = 114.430739
+lat = 30.509666
+
+# Email notification (optional, QQ Mail example)
+[email]
+enable_send_email = true
+smtp_server = "smtp.qq.com"

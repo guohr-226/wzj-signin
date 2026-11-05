@@ -1,203 +1,259 @@
-<div align="center">
-
 # wzj-signin
 
-**Auto sign-in tool for TeacherMate (微助教)**
+A command-line sign-in tool for TeacherMate (WeZhiJiao). This README describes the current source checkout; published PyPI releases may not include these changes.
 
-[![PyPI](https://img.shields.io/pypi/v/wzj-signin.svg)](https://pypi.org/project/wzj-signin/)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/wzj-signin.svg)](https://pypi.org/project/wzj-signin/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/huanglune/wzj-signin/blob/main/LICENSE)
+English | [中文](README.zh-CN.md)
 
-English | [中文](https://github.com/huanglune/wzj-signin/blob/main/README.zh-CN.md)
+## Features and requirements
 
-</div>
+- **Normal sign-in:** wait a random 8–10 seconds after detecting a task, then submit.
+- **GPS sign-in:** select a configured location on every startup. Apply coordinate jitter once and reuse the result for this run; submission also waits 8–10 seconds.
+- **QR sign-in:** connect over WebSocket and display a compact terminal QR code for manual scanning. Match the configured student number against server success events.
+- **Multiple courses:** process the account's active-sign list sequentially, without filtering it to the configured course ID.
+- **OpenID checks and renewal:** validate on startup and pause for replacement credentials when the API explicitly rejects them during monitoring.
+- **Asynchronous mail:** enqueue notifications and continue sign-in without waiting for SMTP.
 
----
+Requires **Python 3.11+**, network access to the TeacherMate API and WebSocket, and an interactive terminal with standard input. Location selection is mandatory even when only normal sign-ins are expected. Direct `nohup`, terminal-less cron, and systemd service execution are not supported by the current interactive startup. Use interactive SSH, tmux, or screen for remote operation.
 
-## Features
+> The current normal/GPS path has a duplicate-submission issue. Read [Known limitations and issues](#known-limitations-and-issues) before real use.
 
-- **Normal sign-in** — fully automatic
-- **GPS sign-in** — auto sign-in with configured coordinates, with random jitter to avoid detection
-- **QR sign-in** — displays QR code in terminal for scanning
-- **Email notification** — sends alerts on sign-in success/failure
+## Quick start
 
-## Installation
+Run commands from the project root. Do not overwrite existing configuration; credentials on the current server have already been migrated to the local secrets file.
 
-```bash
-pip install wzj-signin
-```
+### 1. Install dependencies
 
-Or run directly without installing:
+With [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uvx wzj-signin
+uv sync
 ```
 
-## Quick Start
+### 2. Create configuration on a new installation
 
-### Environment Variables (Recommended)
+Copy templates only when setting up a new environment. `-n` prevents overwriting existing files:
 
 ```bash
-OPEN_ID=xxx COURSE_ID=123 STUDENT_ID=456 wzj-signin
+cp -n config.toml.example config.toml
+cp -n config.secrets.toml.example config.secrets.toml
+chmod 600 config.secrets.toml
 ```
 
-You can also pass the full TeacherMate URL as OPEN_ID:
+Edit locations in the shared file and credentials in the secrets file. Both files are read from the **current working directory**, not the executable's directory.
+
+### 3. Start
 
 ```bash
-OPEN_ID="https://v18.teachermate.cn/wechat-pro-ssr/?openid=xxx&from=wzj" COURSE_ID=123 uvx wzj-signin
+.venv/bin/wzj-signin
 ```
 
-### Config File
+The existing script and module entry point are alternatives:
 
-Place a `config.toml` in the working directory (see [config.toml.example](https://github.com/huanglune/wzj-signin/blob/main/config.toml.example)):
+```bash
+sh run.sh
+# Or use the module entry point.
+.venv/bin/python -m wzj_signin
+```
+
+After OpenID validation, enter a valid location number and confirm the selected name before polling begins. OpenID prompts hide input. Press `Ctrl+C` to stop.
+
+## Configuration layout
+
+| File | Contents | Git policy |
+| --- | --- | --- |
+| `config.toml` | Polling, request timeouts, locations, mail enable flag and SMTP host | Shared configuration; suitable for committing |
+| `config.secrets.toml` | OpenID, course identifier, student number, sender, authorization code and receiver | Ignored by `.gitignore`; local only |
+| `config.toml.example` | Shared-settings template | Safe to commit |
+| `config.secrets.toml.example` | Placeholder credentials template | Safe to commit only with placeholders |
+
+### Shared settings: `config.toml`
 
 ```toml
 [default]
-openId = "xxx"
-courseId = "123"
-studentId = "456"
 pollInterval = 10
+connectTimeout = 5
+readTimeout = 15
+requestRetries = 2
+retryBackoff = 1.0
+# Optional API base URL override.
+# apiBaseUrl = "https://v18.teachermate.cn"
 
-# GPS coordinates (optional)
-gps_lon = 113.999877
-gps_lat = 22.595876
+[[locations]]
+name = "Example location"
+lon = 113.999877
+lat = 22.595876
 
-# Email notification (optional)
 [email]
 enable_send_email = false
 smtp_server = "smtp.qq.com"
+```
+
+- Add one `[[locations]]` entry per location, with `name`, `lon`, and `lat`. File order determines menu numbering.
+- At least one location is required. Invalid numbers prompt again; there is no implicit default.
+- Selection applies an independent random offset within ±0.0001 degrees to each coordinate and formats it to six decimal places. The run reuses this pair.
+- Legacy `gps_lon`, `gps_lat`, `GPS_LON`, and `GPS_LAT` settings are no longer read.
+- `pollInterval` is the delay after processing a batch, not a fixed polling cadence. Sign-in delays, requests, and QR waiting add to it.
+
+Location names and coordinates become public with this file. Do not commit locations you want to keep private. Do not move account credentials back here: those fields are read only from the secrets file or environment.
+
+### Local credentials: `config.secrets.toml`
+
+```toml
+[default]
+openId = "your_open_id_or_full_url"
+courseId = "your_course_id"
+studentId = "your_student_id"
+
+[email]
 sender = "your@qq.com"
-password = "your_smtp_password"
+password = "your_smtp_authorization_code"
 receiver = "notify@example.com"
 ```
 
-> Environment variables take priority over config file values.
->
-> If `OPEN_ID` is the full TeacherMate URL, `wzj-signin` now extracts both the `openid` and the API host from that URL automatically.
+- `openId` accepts a raw value or a full TeacherMate URL containing an `openid` query parameter. An empty value falls back to `OPEN_ID`, then to an interactive prompt.
+- `courseId` is still required at startup, but submissions use each active task's course ID. This setting is not a monitoring whitelist.
+- `studentId` is the student number used to recognize QR success, not the OpenID.
+- Mail credentials may be omitted while mail is disabled. Enabled mail requires `sender`, `password`, and `receiver`.
+- For QQ Mail, enable SMTP and use its SMTP authorization code rather than the regular account password.
 
-## Environment Variables
+### Precedence and environment variables
 
-| Variable | Description | Required |
-|:---------|:------------|:--------:|
-| `OPEN_ID` | TeacherMate openId or full URL | ✅ |
-| `COURSE_ID` | Course ID | ✅ |
-| `STUDENT_ID` | Student ID (required for QR sign-in) | — |
-| `POLL_INTERVAL` | Polling interval in seconds (default: `10`) | — |
-| `API_BASE_URL` | Override API base URL; if `OPEN_ID` is a full URL, its host is used automatically | — |
-| `CONNECT_TIMEOUT` | Connection timeout in seconds (default: `5`) | — |
-| `READ_TIMEOUT` | Response read timeout in seconds (default: `15`) | — |
-| `REQUEST_RETRIES` | Retry count for connection-stage failures (default: `2`) | — |
-| `RETRY_BACKOFF` | Retry backoff factor in seconds (default: `1.0`) | — |
-| `GPS_LON` | GPS longitude | — |
-| `GPS_LAT` | GPS latitude | — |
-| `ENABLE_SEND_EMAIL` | Enable email notification (`true` / `1`) | — |
-| `SMTP_SERVER` | SMTP server (default: `smtp.qq.com`) | — |
-| `EMAIL_SENDER` | Sender email address | — |
-| `EMAIL_PASSWORD` | SMTP authorization code | — |
-| `EMAIL_RECEIVER` | Receiver email address | — |
+**OpenID is the exception:** a nonempty saved `openId` takes priority over `OPEN_ID`. For other fields below, nonempty environment values override their respective file values. The mail-enable variable overrides the file whenever present, including `false`, `0`, and an empty string.
 
-## Tutorial
+| Environment variable | File field | Default or requirement |
+| --- | --- | --- |
+| `OPEN_ID` | Secrets `[default].openId` | Raw value or full URL; prompt when missing |
+| `COURSE_ID` | Secrets `[default].courseId` | Required |
+| `STUDENT_ID` | Secrets `[default].studentId` | Needed for QR success matching |
+| `POLL_INTERVAL` | Shared `[default].pollInterval` | `10` seconds |
+| `CONNECT_TIMEOUT` | Shared `[default].connectTimeout` | `5` seconds; positive |
+| `READ_TIMEOUT` | Shared `[default].readTimeout` | `15` seconds; positive |
+| `REQUEST_RETRIES` | Shared `[default].requestRetries` | `2`; connection-stage retries only |
+| `RETRY_BACKOFF` | Shared `[default].retryBackoff` | `1.0`; nonnegative |
+| `API_BASE_URL` | Shared `[default].apiBaseUrl` | Explicit API base override |
+| `ENABLE_SEND_EMAIL` | Shared `[email].enable_send_email` | `true` / `1` enables; other values disable; absent uses file |
+| `SMTP_SERVER` | Shared `[email].smtp_server` | `smtp.qq.com`; port fixed at `465` |
+| `EMAIL_SENDER` | Secrets `[email].sender` | Sender address |
+| `EMAIL_PASSWORD` | Secrets `[email].password` | SMTP authorization code |
+| `EMAIL_RECEIVER` | Secrets `[email].receiver` | One receiver address |
+
+Without an explicit API override, a full OpenID URL supplies the API origin. An initial raw OpenID uses `https://v18.teachermate.cn`. Renewing with a raw value keeps the current API origin; a full URL may change it. Explicit API settings always take priority.
+
+Disable mail for a run without editing files:
+
+```bash
+ENABLE_SEND_EMAIL=false .venv/bin/wzj-signin
+```
+
+Environment-only credentials still require locations in the shared configuration. There is no environment variable for choosing a location.
+
+## OpenID validation and recovery
+
+Startup validation uses the read-only `GET /wechat-api/v1/class-attendance/student/active_signs` endpoint, not a sign-in submission. An empty list means valid credentials with no active tasks.
+
+- **HTTP 401 or explicit invalid/expired OpenID or login text:** request a replacement raw value or full URL and validate it before starting or resuming monitoring.
+- **Timeouts, network errors, and HTTP 5xx:** keep credentials and retry at the configured interval without requesting a replacement.
+- **Other or unknown responses:** log a request/API error; do not infer expiration from guessed numeric error codes.
+
+Renewal updates both the request configuration and the Session OpenID header. Replacement values stay in memory and are never automatically written to either file. To persist a change across restarts, edit the local secrets file manually. Logs avoid full OpenIDs, student numbers, and SMTP authorization codes; inspect logs and screenshots before sharing them anyway.
+
+## QR sign-in and email notifications
+
+### QR sign-in
+
+After detecting a QR task, the program enqueues an email without blocking, then immediately starts the connection to `wss://www.teachermate.com.cn/faye`. A pushed `qrUrl` is rendered directly in the terminal; no QR image attachment is mailed.
+
+Keep the terminal visible and scan through a TeacherMate-supported flow. The program confirms your QR sign-in only when a server event matches the configured student number. It stays in that QR workflow until success or connection closure.
+
+### Asynchronous mail
+
+Importing the mail module does not connect to or validate SMTP. The first eligible notification starts one daemon worker, which drains `queue.Queue(maxsize=32)` serially. Capacity counts waiting messages, excluding the message currently being processed.
+
+| Log marker | Meaning |
+| --- | --- |
+| `Email notification queued` | Accepted into the queue, not yet a delivery confirmation |
+| `Email SMTP connecting` / `authenticating` / `sending` | Worker connection, authentication and send stages |
+| `Email delivery succeeded (SMTP accepted)` | Accepted by SMTP, not a guarantee of inbox delivery |
+| `Email delivery failed during ...` | This message failed; later mail and sign-in can continue |
+| `Email queue full` | This notification was not enqueued |
+
+SMTP_SSL uses `timeout=10` per socket operation, not as a whole-message deadline; total delivery can exceed 10 seconds. Failed messages and full-queue notifications are not retried automatically. The queue is not persistent: in-flight or waiting mail may be lost on process exit. SMTP cleanup failure does not invalidate a message already accepted by the server.
+
+Notifications cover QR discovery, sign-in success, the missing-GPS-coordinates failure branch, and OpenID expiration during monitoring. Not every API or WebSocket error produces mail.
+
+## Obtaining account information
 
 <details>
-<summary><b>Get OpenId</b></summary>
+<summary>Get OpenID</summary>
 
-1. Tap "All (A)" in the TeacherMate WeChat service account
+1. Open “All (A)” in the TeacherMate WeChat service account.
 
-   ![Enter TeacherMate](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/enter-wzj.png)
+   ![Enter TeacherMate](docs/enter-wzj.png)
 
-2. Copy the URL from the browser address bar
+2. Copy the full page URL.
 
-   ![Copy link](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/copy-link.png)
+   ![Copy link](docs/copy-link.png)
+   ![Get link](docs/get-link.png)
 
-   ![Get link](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/get-link.png)
+3. Put the full URL or the value after `openid=` into local `config.secrets.toml`, or enter it when prompted for renewal.
 
-3. The part after `openid=` in the URL is your OpenId:
-
+   ```text
+   https://v18.teachermate.cn/wechat-pro-ssr/?openid=your_open_id&from=wzj
    ```
-   https://v18.teachermate.cn/wechat-pro-ssr/?openid=52279xxxxxxxxx81803b6cc9bb1cd24f&from=wzj
-   ```
 
-   You can also use the full URL as `OPEN_ID` directly — the program will extract it automatically.
+Do not publish the full URL in issues, commits, or screenshots.
 
 </details>
 
 <details>
-<summary><b>Get Course ID</b></summary>
+<summary>Get course ID</summary>
 
-1. Open the TeacherMate course page and launch browser DevTools (F12)
+1. Open the course page and browser developer tools.
 
-   ![Open course](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/open-course.png)
+   ![Course page](docs/open-course.png)
+   ![Developer tools](docs/devtools.png)
 
-   ![DevTools](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/devtools.png)
+2. Locate a course-related API request in Network and inspect `courseId`.
 
-2. Find the course-related API request in the Network tab to get the `courseId`
+   ![Inspect request](docs/view-request.png)
+   ![Find course ID](docs/find-course-id.png)
+   ![Course ID details](docs/course-id-detail.png)
+   ![Confirm course ID](docs/confirm-course-id.png)
 
-   ![View request](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/view-request.png)
-
-   ![Find courseId](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/find-course-id.png)
-
-   ![courseId details](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/course-id-detail.png)
-
-   ![Confirm courseId](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/confirm-course-id.png)
+3. Save it as `[default].courseId` in the local secrets file.
 
 </details>
 
-<details>
-<summary><b>Configure config.toml</b></summary>
+## Troubleshooting and limitations
 
-1. Copy the example config to your working directory:
+| Symptom | Check |
+| --- | --- |
+| `Missing COURSE_ID` | Set secrets `courseId` or `COURSE_ID` |
+| `No locations configured` | Check the working directory and shared `[[locations]]` entries |
+| `Interactive terminal required` | Provide terminal-backed standard input rather than a detached background launch |
+| WebSocket connected but no QR | Wait for a QR push, verify the task is still active, and inspect WebSocket errors; queued mail does not prove QR reception |
+| Still waiting after scanning | Ensure the configured student number matches the event's `studentNumber` |
+| Mail accepted but absent from inbox | Check spam, receiver address and mailbox delivery rules |
+| API connectivity problems | HTTP ignores environment proxies and WebSocket bypasses them too; do not rely on `HTTPS_PROXY` |
 
-   ```bash
-   cp config.toml.example config.toml
-   ```
+## Development checks
 
-2. Edit `config.toml` with your information:
+Run the existing unittest suite:
 
-   ```toml
-   [default]
-   openId = "your OpenId"
-   courseId = "your Course ID"
-   studentId = "your Student ID"  # required for QR sign-in
-   pollInterval = 10               # polling interval (seconds)
+```bash
+.venv/bin/python -B -m unittest discover -s tests -v
+```
 
-   # GPS coordinates (optional, remove if not needed)
-   gps_lon = 113.999877
-   gps_lat = 22.595876
-   ```
+Tests use simulated responses and SMTP, without sending real mail or performing real course sign-ins. Passing tests do not verify the external API, actual scanning, or final mail delivery.
 
-3. To enable email notifications, configure the `[email]` section:
+## Screenshots
 
-   ```toml
-   [email]
-   enable_send_email = true
-   smtp_server = "smtp.qq.com"
-   sender = "your@qq.com"
-   password = "your SMTP authorization code"
-   receiver = "notification@example.com"
-   ```
+Existing screenshots illustrate operation and notifications; current terminal rendering and logs may differ.
 
-4. Run:
+![Running example](docs/running.png)
+![Email example](docs/email-notification.png)
 
-   ```bash
-   wzj-signin
-   ```
-
-</details>
-
-## Demo
-
-After starting, the program polls for active sign-ins and handles normal, GPS, and QR sign-ins automatically:
-
-![Running](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/running.png)
-
-Email notification:
-
-![Email notification](https://raw.githubusercontent.com/huanglune/wzj-signin/main/docs/email-notification.png)
-
-## Reference
+## References and license
 
 - [zn-cn/wzj-sign-in-weixin](https://github.com/zn-cn/wzj-sign-in-weixin)
-
-## License
-
-[MIT](https://github.com/huanglune/wzj-signin/blob/main/LICENSE)
+- [MIT License](LICENSE)

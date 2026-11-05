@@ -1,7 +1,5 @@
 [default]
-openId = "your_open_id"
-courseId = "your_course_id"
-studentId = "your_student_id"
+# Credentials belong in config.secrets.toml.
 pollInterval = 10
 connectTimeout = 5
 readTimeout = 15
@@ -12,14 +10,13 @@ retryBackoff = 1.0
 # When OPEN_ID is a full TeacherMate URL, the same scheme + host is used automatically.
 # apiBaseUrl = "https://v18.teachermate.cn"
 
-# GPS coordinates (optional)
-gps_lon = 113.999877
-gps_lat = 22.595876
+# Add locations here; select one interactively on each startup.
+[[locations]]
+name = "Example location"
+lon = 113.999877
+lat = 22.595876
 
 # Email notification (optional, QQ Mail example)
 [email]
 enable_send_email = false
 smtp_server = "smtp.qq.com"
-sender = "your@qq.com"
-password = "your_smtp_password"
-receiver = "your@qq.com"

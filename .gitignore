@@ -9,8 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
-# Config with credentials
-config.toml
+# Local credentials; ordinary config.toml is safe to share.
+/config.secrets.toml
 
 # Local task artifacts
 .codex-tasks/
+
+uv.lock
