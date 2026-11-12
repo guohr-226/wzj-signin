@@ -8,8 +8,8 @@ English | [中文](README.zh-CN.md)
 
 - **Normal sign-in:** wait a random 8–10 seconds after detecting a task, then submit.
 - **GPS sign-in:** select a configured location on every startup. Apply coordinate jitter once and reuse the result for this run; submission also waits 8–10 seconds.
-- **QR sign-in:** connect over WebSocket and display a compact terminal QR code for manual scanning. Match the configured student number against server success events.
-- **Multiple courses:** process the account's active-sign list sequentially, without filtering it to the configured course ID.
+- **QR sign-in:** run each active task in a background thread and display a compact terminal QR code for manual scanning. Match the configured student number against server success events.
+- **Multiple courses:** process normal/GPS tasks sequentially while QR tasks run independently, without filtering active signs to the configured course ID.
 - **OpenID checks and renewal:** validate on startup and pause for replacement credentials when the API explicitly rejects them during monitoring.
 - **Asynchronous mail:** enqueue notifications and continue sign-in without waiting for SMTP.
 
@@ -92,7 +92,7 @@ smtp_server = "smtp.qq.com"
 - At least one location is required. Invalid numbers prompt again; there is no implicit default.
 - Selection applies an independent random offset within ±0.0001 degrees to each coordinate and formats it to six decimal places. The run reuses this pair.
 - Legacy `gps_lon`, `gps_lat`, `GPS_LON`, and `GPS_LAT` settings are no longer read.
-- `pollInterval` is the delay after processing a batch, not a fixed polling cadence. Sign-in delays, requests, and QR waiting add to it.
+- `pollInterval` is the delay after processing a batch, not a fixed polling cadence. Normal/GPS delays and HTTP requests add to it; waiting for QR sign-in does not block polling.
 
 Location names and coordinates become public with this file. Do not commit locations you want to keep private. Do not move account credentials back here: those fields are read only from the secrets file or environment.
 
@@ -161,9 +161,9 @@ Renewal updates both the request configuration and the Session OpenID header. Re
 
 ### QR sign-in
 
-After detecting a QR task, the program enqueues an email without blocking, then immediately starts the connection to `wss://www.teachermate.com.cn/faye`. A pushed `qrUrl` is rendered directly in the terminal; no QR image attachment is mailed.
+After detecting a QR task, the program enqueues an email without blocking and starts a dedicated background connection to `wss://www.teachermate.com.cn/faye`. Only one active task is allowed per `signId`. A pushed `qrUrl` is rendered directly in the terminal; no QR image attachment is mailed.
 
-Keep the terminal visible and scan through a TeacherMate-supported flow. The program confirms your QR sign-in only when a server event matches the configured student number. It stays in that QR workflow until success or connection closure.
+Keep the terminal visible and scan through a TeacherMate-supported flow. A matching student event closes the WebSocket, cancels the heartbeat, completes the task and marks its `signId` as signed. Repeated polls do not restart completed tasks or duplicate their notifications. Disconnects, ping timeouts and other errors release the task so a later poll can retry. Each connection maintains one Bayeux heartbeat timer and sends its subscription once. Exiting the monitor stops active QR tasks.
 
 ### Asynchronous mail
 

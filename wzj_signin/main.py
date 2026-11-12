@@ -3,6 +3,7 @@ import sys
 import tomllib
 import random
 import time
+import threading
 from pathlib import Path
 
 import requests
@@ -105,6 +106,8 @@ USER_AGENT = (
 )
 
 signed_ids: set[int] = set()
+_qr_tasks: dict[int, tuple[QRSign, threading.Thread]] = {}
+_qr_tasks_lock = threading.Lock()
 
 
 def _parse_int(value: str | int, name: str) -> int:
@@ -247,6 +250,52 @@ def sign_in_one(
     return True
 
 
+def _start_qr_task(course_id, sign_id: int, course_name: str, student_id: str) -> None:
+    def run():
+        try:
+            if qr.start():
+                with _qr_tasks_lock:
+                    signed_ids.add(sign_id)
+                send_email(
+                    "Sign-in Success", f"{course_name} QR sign-in success signId={sign_id}"
+                )
+        except Exception as err:
+            log.error("QR task failed signId=%s (%s)", sign_id, type(err).__name__)
+        finally:
+            qr.stop()
+            with _qr_tasks_lock:
+                _qr_tasks.pop(sign_id, None)
+
+    with _qr_tasks_lock:
+        if sign_id in signed_ids or sign_id in _qr_tasks:
+            return
+        qr = QRSign(str(course_id), sign_id, student_id)
+        worker = threading.Thread(target=run, name=f"qr-sign-{sign_id}", daemon=True)
+        _qr_tasks[sign_id] = (qr, worker)
+    try:
+        log.info("QR sign-in found: %s (signId=%s)", course_name, sign_id)
+        send_email(
+            "QR Sign-in Found",
+            f"{course_name} QR sign-in signId={sign_id}, please scan the QR code ASAP...",
+        )
+        worker.start()
+    except Exception as err:
+        qr.stop()
+        with _qr_tasks_lock:
+            _qr_tasks.pop(sign_id, None)
+        log.error("QR task could not start signId=%s (%s)", sign_id, type(err).__name__)
+
+
+def _stop_qr_tasks() -> None:
+    with _qr_tasks_lock:
+        tasks = list(_qr_tasks.values())
+    for qr, _ in tasks:
+        qr.stop()
+    for _, worker in tasks:
+        if worker.ident is not None:
+            worker.join(timeout=2)
+
+
 def process_signs(
     session: requests.Session,
     request_config: RequestConfig,
@@ -260,8 +309,9 @@ def process_signs(
         course_name = sign.get("name", "")
         name = sign.get("name", "")
 
-        if sign_id in signed_ids:
-            continue
+        with _qr_tasks_lock:
+            if sign_id in signed_ids:
+                continue
 
         if sign.get("isGPS") == 1:
             log.info("GPS sign-in found: %s (signId=%s)", name, sign_id)
@@ -286,18 +336,7 @@ def process_signs(
             continue
 
         if sign.get("isQR") == 1:
-            log.info("QR sign-in found: %s (signId=%s)", name, sign_id)
-
-            send_email(
-                "QR Sign-in Found",
-                f"{course_name} QR sign-in signId={sign_id}, please scan the QR code ASAP...",
-            )
-            qr = QRSign(str(course_id), sign_id, student_id)
-            if qr.start():
-                signed_ids.add(sign_id)
-                send_email(
-                    "Sign-in Success", f"{course_name} QR sign-in success signId={sign_id}"
-                )
+            _start_qr_task(course_id, sign_id, course_name, student_id)
             continue
 
         log.info("Normal sign-in found: %s (signId=%s)", name, sign_id)
@@ -330,23 +369,26 @@ def main() -> None:
     )
     consecutive_errors = 0
 
-    while True:
-        try:
-            signs = get_active_signs(session, request_config)
-            consecutive_errors = 0
-            log.info("Poll succeeded, %d active sign(s)", len(signs))
-            if signs:
-                process_signs(session, request_config, signs, student_id, positions)
-        except OpenIDExpired:
-            log.warning("OpenID expired; pausing monitoring for renewal")
-            send_email("Monitor Error", "OpenID expired; terminal input is required")
-            request_config = _validate_open_id(
-                session, request_config, poll_interval, config["apiBaseUrl"], renew=True
-            )
-            consecutive_errors = 0
-        except requests.RequestException as exc:
-            consecutive_errors += 1
-            _log_request_error(f"Request failed (consecutive #{consecutive_errors})", exc)
-        except Exception as exc:
-            log.error("Unexpected monitor error (%s)", type(exc).__name__)
-        sleep_with_progress(poll_interval)
+    try:
+        while True:
+            try:
+                signs = get_active_signs(session, request_config)
+                consecutive_errors = 0
+                log.info("Poll succeeded, %d active sign(s)", len(signs))
+                if signs:
+                    process_signs(session, request_config, signs, student_id, positions)
+            except OpenIDExpired:
+                log.warning("OpenID expired; pausing monitoring for renewal")
+                send_email("Monitor Error", "OpenID expired; terminal input is required")
+                request_config = _validate_open_id(
+                    session, request_config, poll_interval, config["apiBaseUrl"], renew=True
+                )
+                consecutive_errors = 0
+            except requests.RequestException as exc:
+                consecutive_errors += 1
+                _log_request_error(f"Request failed (consecutive #{consecutive_errors})", exc)
+            except Exception as exc:
+                log.error("Unexpected monitor error (%s)", type(exc).__name__)
+            sleep_with_progress(poll_interval)
+    finally:
+        _stop_qr_tasks()
